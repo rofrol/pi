@@ -117,13 +117,53 @@ function isPlainNonEmptyObject(value: unknown): boolean {
 }
 
 /**
+ * Pull a human-readable lead message out of a raw JSON error body. First hit
+ * wins: top-level `message` → `error.message` when `error` is an object →
+ * `detail`. Only non-empty strings qualify, and the string is returned verbatim
+ * (never trimmed or rewritten).
+ *
+ * A body whose `error` field is a plain string is never humanized (contract
+ * non-goal: `{"error":"..."}` stays raw). Such a body renders alone, unchanged,
+ * even when it also carries `message` or `detail`: the provider's own `error`
+ * text is the source of truth there and must not be displaced by another
+ * field. Anything else — non-JSON bodies, non-object JSON, empty or non-string
+ * messages — also yields `undefined` so the raw body renders alone, unchanged.
+ */
+function extractHumanMessage(body: string): string | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(body);
+	} catch {
+		return undefined;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+	const root = parsed as Record<string, unknown>;
+	if (typeof root.error === "string") return undefined;
+	const nested = root.error;
+	const nestedMessage =
+		typeof nested === "object" && nested !== null && !Array.isArray(nested)
+			? (nested as Record<string, unknown>).message
+			: undefined;
+	for (const candidate of [root.message, nestedMessage, root.detail]) {
+		if (typeof candidate === "string" && candidate.trim().length > 0) return candidate;
+	}
+	return undefined;
+}
+
+/**
  * Compose a display string from a normalized error. When the message already
  * carries the body (Anthropic / `@google/genai` happy path) or no body/status
  * was extracted, the message is returned unchanged. Otherwise the status and
  * body are surfaced, with an optional provider prefix.
  *
- * - no prefix: `"<status>: <body>"`
- * - prefix:    `"<prefix> (<status>): <body>"`
+ * When the raw body is a JSON object carrying a human-readable message (see
+ * `extractHumanMessage`), the composed string leads with that message and
+ * keeps the unchanged raw body after a `"Raw response: "` marker, so
+ * substring consumers (context-overflow detection, retry classification) still
+ * see the full body verbatim.
+ *
+ * - no prefix: `"<status>: <body>"` or `"<status>: <message>\nRaw response: <body>"`
+ * - prefix:    `"<prefix> (<status>): <body>"` or `"<prefix> (<status>): <message>\nRaw response: <body>"`
  */
 export function formatProviderError(norm: NormalizedProviderError, prefix?: string): string {
 	if (norm.messageCarriesBody || norm.status === undefined || norm.body === undefined) {
@@ -131,7 +171,9 @@ export function formatProviderError(norm: NormalizedProviderError, prefix?: stri
 			? `${prefix} (${norm.status}): ${norm.message}`
 			: norm.message;
 	}
-	return prefix !== undefined ? `${prefix} (${norm.status}): ${norm.body}` : `${norm.status}: ${norm.body}`;
+	const head = prefix !== undefined ? `${prefix} (${norm.status}): ` : `${norm.status}: `;
+	const humanMessage = extractHumanMessage(norm.body);
+	return humanMessage === undefined ? `${head}${norm.body}` : `${head}${humanMessage}\nRaw response: ${norm.body}`;
 }
 
 export function truncateErrorText(text: string, maxChars: number): string {
